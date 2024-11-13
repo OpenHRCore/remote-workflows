@@ -1,0 +1,313 @@
+name: Reusable workflow for pipeline setup
+
+on:
+  workflow_call:
+    secrets:
+      BOT_TOKEN:
+        required: true
+
+jobs:
+  pipeline-setup:
+    runs-on: ${{ vars.RUNNER_NAME || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up CI/CD variables
+        run: |
+          echo "Setting up Pipeline"
+          echo "Adding CI/CD variables..."
+          if [ -f "$GITHUB_WORKSPACE/cicd-variables.json" ] && [ -s "$GITHUB_WORKSPACE/cicd-variables.json" ] && [ "${{ vars.ENABLE_WORKFLOWS }}" == "true" ]; then
+            for key in $(jq -c 'keys' $GITHUB_WORKSPACE/cicd-variables.json | jq -r .[]); do
+              value=$(jq -r .$key $GITHUB_WORKSPACE/cicd-variables.json)
+              echo "key: $key and value: $value"
+              JSON_DATA=$(jq -n \
+                --arg KEY "$key" \
+                --arg VALUE "$value" \
+                '{ "name": $KEY, "value": $VALUE }')
+              if [[ $(curl --write-out '%{http_code}' --silent --output /dev/null --header "Authorization: Bearer ${{ secrets.BOT_TOKEN }}" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables/${key}") != "200" ]]; then
+                echo "Creating variable $key"
+                curl --silent --write-out '%{http_code}' --output /dev/null --request POST --header "Authorization: Bearer ${{ secrets.BOT_TOKEN }}" --header "Accept: application/vnd.github+json" --header "Content-Type: application/json" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables" --data "$JSON_DATA"
+                echo -e "\n"
+              else
+                echo "Updating variable $key"
+                curl --silent --write-out '%{http_code}' --output /dev/null --request PATCH --header "Authorization: Bearer ${{ secrets.BOT_TOKEN }}" --header "Accept: application/vnd.github+json" --header "Content-Type: application/json" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables/${key}" --data "$JSON_DATA"
+                echo -e "\n"
+              fi
+            done
+          elif [ ! -f "$GITHUB_WORKSPACE/cicd-variables.json" ]; then
+            echo "cicd-variables.json not found. Skipping variable setup." >> $GITHUB_STEP_SUMMARY
+          elif [ ! -s "$GITHUB_WORKSPACE/cicd-variables.json" ]; then
+            echo "cicd-variables.json is empty. Skipping variable setup." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Workflows are disabled for the first time run. Skipping variable setup." >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Enable workflows for next run
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          echo "Setting ENABLE_WORKFLOWS to true..."
+          JSON_DATA=$(jq -n \
+            --arg KEY "ENABLE_WORKFLOWS" \
+            --arg VALUE "true" \
+            '{ "name": $KEY, "value": $VALUE }')
+          
+          if [[ $(curl --write-out '%{http_code}' --silent --output /dev/null --header "Authorization: Bearer ${{ secrets.BOT_TOKEN }}" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables/ENABLE_WORKFLOWS") != "200" ]]; then
+            echo "Creating ENABLE_WORKFLOWS variable"
+            curl --silent --write-out '%{http_code}' --output /dev/null --request POST --header "Authorization: Bearer ${{ secrets.BOT_TOKEN }}" --header "Accept: application/vnd.github+json" --header "Content-Type: application/json" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables" --data "$JSON_DATA"
+          else
+            echo "Updating ENABLE_WORKFLOWS variable"
+            curl --silent --write-out '%{http_code}' --output /dev/null --request PATCH --header "Authorization: Bearer ${{ secrets.BOT_TOKEN }}" --header "Accept: application/vnd.github+json" --header "Content-Type: application/json" "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/variables/ENABLE_WORKFLOWS" --data "$JSON_DATA"
+          fi
+          echo "✅ ENABLE_WORKFLOWS set to true" >> $GITHUB_STEP_SUMMARY
+
+      - name: Set default branch
+        id: set-default-branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          echo "Setting default branch..."
+          
+          # Check if main branch exists
+          if git ls-remote --exit-code origin main; then
+            DEFAULT_BRANCH="main"
+          elif git ls-remote --exit-code origin master; then
+            DEFAULT_BRANCH="master"
+          else
+            echo "❌ Neither main nor master branch found" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+          echo "Setting $DEFAULT_BRANCH as default branch..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH \
+            -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            ${{ github.api_url }}/repos/${{ github.repository }} \
+            -d "{\"default_branch\":\"$DEFAULT_BRANCH\"}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          CONTENT=$(echo "$RESPONSE" | sed '$ d')
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Default branch set to $DEFAULT_BRANCH"
+            echo "✅ Default branch set to $DEFAULT_BRANCH" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Failed to set default branch (HTTP $HTTP_CODE)"
+            echo "Response: $CONTENT"
+            echo "❌ Failed to set default branch" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Set up branch protection rules
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DEFAULT_BRANCH: ${{ steps.set-default-branch.outputs.default_branch }}
+        run: |
+          echo "Starting branch protection setup..."
+          echo "Default branch: $DEFAULT_BRANCH"
+
+          # Get PR_REVIEWERS from API with fallback
+          echo "Fetching PR_REVIEWERS from repository variables..."
+          PR_REVIEWERS_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/actions/variables/PR_REVIEWERS)
+          
+          HTTP_CODE=$(echo "$PR_REVIEWERS_RESPONSE" | tail -n 1)
+          CONTENT=$(echo "$PR_REVIEWERS_RESPONSE" | sed '$ d')
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            PR_REVIEWERS=$(echo "$CONTENT" | jq -r '.value')
+            echo "✅ Found PR_REVIEWERS: $PR_REVIEWERS"
+          else
+            PR_REVIEWERS=${{ vars.PR_REVIEWERS }}
+            echo "⚠️ PR_REVIEWERS not found, using default value: $PR_REVIEWERS"
+          fi
+
+          # Convert comma-separated PR_REVIEWERS to JSON array
+          REVIEWERS_ARRAY=$(echo "$PR_REVIEWERS" | sed 's/,/","/g' | sed 's/.*/"&"/' | sed 's/,/, /g')
+          echo "Reviewers array: $REVIEWERS_ARRAY"
+
+          # Base protection rules template
+          BASE_RULES=$(cat << EOF
+          {
+            "required_status_checks": null,
+            "enforce_admins": false,
+            "required_pull_request_reviews": {
+              "dismiss_stale_reviews": true,
+              "require_code_owner_reviews": false,
+              "required_approving_review_count": 1,
+              "bypass_pull_request_allowances": {
+                "users": [${REVIEWERS_ARRAY}],
+                "teams": []
+              }
+            },
+            "restrictions": {
+              "users": [${REVIEWERS_ARRAY}],
+              "teams": [],
+              "apps": []
+            },
+            "required_linear_history": false,
+            "allow_force_pushes": false,
+            "allow_deletions": false,
+            "block_creations": false,
+            "required_conversation_resolution": false,
+            "lock_branch": false
+          }
+          EOF
+          )
+
+          echo "Protection rules template:"
+          echo "$BASE_RULES" | jq '.'
+
+          # Function to check if branch exists
+          check_branch_exists() {
+            local branch=$1
+            echo "Checking if branch '$branch' exists..."
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              ${{ github.api_url }}/repos/${{ github.repository }}/branches/$branch)
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+            CONTENT=$(echo "$RESPONSE" | sed '$ d')
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Branch '$branch' exists"
+              return 0
+            else
+              echo "❌ Branch '$branch' does not exist (HTTP $HTTP_CODE)"
+              echo "Response: $CONTENT"
+              return 1
+            fi
+          }
+
+          # Function to set branch protection
+          setup_branch_protection() {
+            local branch=$1
+            local rules=$2
+            
+            echo "Setting protection rules for '$branch' branch..."
+            echo "Request URL: ${{ github.api_url }}/repos/${{ github.repository }}/branches/$branch/protection"
+            
+            if check_branch_exists "$branch"; then
+              RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+                -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                ${{ github.api_url }}/repos/${{ github.repository }}/branches/$branch/protection \
+                -d "$rules")
+              
+              HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+              CONTENT=$(echo "$RESPONSE" | sed '$ d')
+              
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "Protection rules set for '$branch' branch"
+                echo "✅ Protection rules set for '$branch' branch" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "Failed to set protection rules for '$branch' branch"
+                echo "❌ Failed to set protection rules for '$branch' branch (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+                echo "Response: $CONTENT"
+              fi
+            else
+              echo "Skipping protection rules for non-existent branch '$branch'"
+              echo "⏭️ Skipped protection rules for non-existent branch '$branch'" >> $GITHUB_STEP_SUMMARY
+            fi
+          }
+
+          # Set protection for each branch
+          for branch in "develop" "staging" "$DEFAULT_BRANCH"; do
+            echo "Processing branch: $branch"
+            setup_branch_protection "$branch" "$BASE_RULES"
+            echo "---"
+          done
+
+          echo "Branch protection setup completed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Set up tag protection ruleset
+        env:
+          GITHUB_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          echo "Setting up tag protection ruleset..."
+          
+          # Create ruleset for release tags
+          RULESET_DATA=$(cat << EOF
+          {
+            "name": "Release Tag Protection",
+            "target": "tag",
+            "enforcement": "active",
+            "conditions": {
+              "ref_name": {
+                "include": ["refs/tags/v*"],
+                "exclude": ["refs/tags/*-beta"]
+              }
+            },
+            "rules": [
+              {
+                "type": "deletion"
+              },
+              {
+                "type": "update",
+                "parameters": {
+                  "update_allows_fetch_and_merge": false
+                }
+              },
+              {
+                "type": "non_fast_forward"
+              }
+            ]
+          }
+          EOF
+          )
+
+          echo "Creating/updating ruleset with configuration:"
+          echo "$RULESET_DATA" | jq '.'
+
+          # Check if ruleset exists
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            ${{ github.api_url }}/repos/${{ github.repository }}/rulesets)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          CONTENT=$(echo "$RESPONSE" | sed '$ d')
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            RULESET_ID=$(echo "$CONTENT" | jq -r '.[] | select(.name=="Release Tag Protection") | .id')
+          fi
+
+          if [ -n "$RULESET_ID" ]; then
+            echo "Updating existing ruleset (ID: $RULESET_ID)..."
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+              -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              ${{ github.api_url }}/repos/${{ github.repository }}/rulesets/$RULESET_ID \
+              -d "$RULESET_DATA")
+          else
+            echo "Creating new ruleset..."
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: token ${{ secrets.BOT_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              ${{ github.api_url }}/repos/${{ github.repository }}/rulesets \
+              -d "$RULESET_DATA")
+          fi
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          CONTENT=$(echo "$RESPONSE" | sed '$ d')
+
+          if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "Tag protection ruleset created/updated successfully"
+            echo "✅ Tag protection ruleset created/updated successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Failed to create/update tag protection ruleset (HTTP $HTTP_CODE)"
+            echo "❌ Failed to create/update tag protection ruleset (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            echo "Response: $CONTENT"
+          fi

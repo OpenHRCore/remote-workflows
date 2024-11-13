@@ -1,0 +1,20 @@
+{
+    "APP_TYPE": "api|web|lambda",
+    "APP_URL": "https://test.com",
+    "PROJECT_DIR": "./",
+    "DEPLOY_TARGET": "ec2|k8s|lambda",
+    "LAMBDA_PROJECT_DIR": "./lambda-project",
+    "DEV_LAMBDA_FUNCTION_NAME": "TEST_LAMBDA_FUNCTION",
+    "DEV_BASE_NAMESPACE": "dev-ns",
+    "DEV_RELEASE_NAME": "dev-rsn",
+    "DEV_CLUSTER": "nonprod-cluster",
+    "UAT_LAMBDA_FUNCTION_NAME": "TEST_LAMBDA_FUNCTION",
+    "UAT_BASE_NAMESPACE": "uat-ns",
+    "UAT_RELEASE_NAME": "uat-rsn",
+    "UAT_CLUSTER": "nonprod-cluster",
+    "PROD_LAMBDA_FUNCTION_NAME": "TEST_LAMBDA_FUNCTION",
+    "PROD_BASE_NAMESPACE": "prod-ns",
+    "PROD_RELEASE_NAME": "prod-rsn",
+    "PROD_CLUSTER": "prod-cluster",
+    "PR_REVIEWERS": "aung-myatkyaw"
+}
