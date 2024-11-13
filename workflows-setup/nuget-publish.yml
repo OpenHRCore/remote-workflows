@@ -1,0 +1,16 @@
+name: NuGet Package Publish
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  nuget:
+    uses: OpenHRCore/remote-workflows/.github/workflows/nuget-publish.yml@main
+    secrets: inherit

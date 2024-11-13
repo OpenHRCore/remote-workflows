@@ -1,0 +1,112 @@
+name: Reusable workflow for NuGet package publish
+
+on:
+  workflow_call:
+    secrets:
+      NUGET_API_KEY:
+        required: true
+
+jobs:
+  build-publish:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ${{ vars.RUNNER_NAME || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ vars.DOTNET_VERSION || '8.0.x' }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal
+
+      - name: Pack and Push Projects
+        id: push_packages
+        run: |
+          echo "# NuGet Package Publishing Results" >> $GITHUB_STEP_SUMMARY
+          echo >> $GITHUB_STEP_SUMMARY
+          
+          success_count=0
+          failed_count=0
+          PUSH_RESULTS=""
+
+          # Find all csproj files
+          for csproj in $(find ${{ vars.PROJECT_DIR || './' }} -name "*.csproj"); do
+            echo "Processing $csproj"
+            
+            # Pack project
+            dotnet pack "$csproj" \
+              --configuration Release \
+              --no-build \
+              -o nupkg
+            
+            # Get package name and version
+            package_name=$(basename "$csproj" .csproj)
+            package_version=$(grep -r '<Version>' "$csproj" | sed -n 's/.*<Version>\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+            if [ -z "$package_version" ]; then
+              package_version=$(grep -r '<PackageVersion>' "$csproj" | sed -n 's/.*<PackageVersion>\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+            fi
+            
+            echo "Publishing package: $package_name version: $package_version"
+            
+            # Push to NuGet.org and capture output
+            {
+              if dotnet nuget push "./nupkg/${package_name}.${package_version}.nupkg" \
+                --api-key ${{ secrets.NUGET_API_KEY }} \
+                --source https://api.nuget.org/v3/index.json; then
+                echo "## ✅ $package_name v$package_version" >> $GITHUB_STEP_SUMMARY
+                echo "Successfully published to NuGet.org" >> $GITHUB_STEP_SUMMARY
+                PUSH_RESULTS="${PUSH_RESULTS}✅ $package_name v$package_version: Successfully published\n"
+                ((success_count++))
+              else
+                echo "## ⚠️ $package_name v$package_version" >> $GITHUB_STEP_SUMMARY
+                echo "Failed to publish. Error output:" >> $GITHUB_STEP_SUMMARY
+                echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                push_error=$(dotnet nuget push "./nupkg/${package_name}.${package_version}.nupkg" \
+                  --api-key ${{ secrets.NUGET_API_KEY }} \
+                  --source https://api.nuget.org/v3/index.json 2>&1)
+                echo "$push_error" >> $GITHUB_STEP_SUMMARY
+                echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+                PUSH_RESULTS="${PUSH_RESULTS}⚠️ $package_name v$package_version: Failed - $push_error\n"
+                ((failed_count++))
+              fi
+              echo >> $GITHUB_STEP_SUMMARY
+            } || true
+          done
+
+          echo "success_count=$success_count" >> $GITHUB_OUTPUT
+          echo "failed_count=$failed_count" >> $GITHUB_OUTPUT
+          echo "push_results<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$PUSH_RESULTS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Create release notes with push results
+          RELEASE_NOTES=$(cat << EOF
+          # NuGet Package Publishing Results
+
+          ### Summary
+          - ✅ Successfully published: ${{ steps.push_packages.outputs.success_count }}
+          - ⚠️ Failed to publish: ${{ steps.push_packages.outputs.failed_count }}
+
+          ### Detailed Results
+          $(echo -e "${{ steps.push_packages.outputs.push_results }}" | sed 's/Failed - /Failed:\n  Error: /g' | sed 's/PUT.*$//' | sed 's/To skip.*$//')
+          EOF
+          )
+
+          # Create release with results
+          gh release create "release-$(date +%Y%m%d-%H%M%S)" \
+            --title "NuGet Release ($(date '+%Y-%m-%d %H:%M:%S'))" \
+            --notes "$RELEASE_NOTES" \
+            ./nupkg/*.nupkg
