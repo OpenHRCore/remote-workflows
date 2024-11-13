@@ -6,8 +6,6 @@ on:
       BOT_TOKEN:
         required: true
 
-env:
-
 jobs:
   trivy-scan:
     if: github.event_name == 'pull_request' && github.base_ref == github.event.repository.default_branch
